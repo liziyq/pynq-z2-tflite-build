@@ -32,11 +32,17 @@ jobs:
           git clone --depth 1 --branch v2.13.0 \
             https://github.com/tensorflow/tensorflow.git tensorflow_src
 
-      - name: Change ARM target from VFPv4 to Cortex-A9 VFPv3
+      - name: Patch build for Ubuntu 22.04 and Cortex-A9 VFPv3
         run: |
           set -euxo pipefail
           script="tensorflow_src/tensorflow/lite/tools/cmake/download_toolchains.sh"
+          dockerfile="tensorflow_src/tensorflow/lite/tools/pip_package/Dockerfile.py3"
+          build_script="tensorflow_src/tensorflow/lite/tools/pip_package/build_pip_package_with_cmake.sh"
           test -f "$script"
+          test -f "$dockerfile"
+          test -f "$build_script"
+
+          # Cortex-A9 supports NEON/VFPv3, not VFPv4.
           grep -n "neon-vfpv4" "$script"
           sed -i 's/-mfpu=neon-vfpv4/-mfpu=neon-vfpv3 -mfloat-abi=hard/g' "$script"
           grep -n "neon-vfpv3" "$script"
@@ -45,13 +51,29 @@ jobs:
             exit 1
           fi
 
+          # Ubuntu 22.04 already provides Python 3.10 for amd64, armhf and
+          # arm64.  The Deadsnakes PPA is amd64-oriented and is unnecessary.
+          sed -i '/add-apt-repository ppa:deadsnakes\/ppa/d' "$dockerfile"
+          sed -i 's/python\$PYTHON_VERSION-distutils/python3-distutils/g' "$dockerfile"
+          if grep -q 'deadsnakes/ppa' "$dockerfile"; then
+            echo "ERROR: Deadsnakes PPA line is still present"
+            exit 1
+          fi
+          grep -n "python3-distutils" "$dockerfile"
+
+          # Limit the actual CMake compile, rather than only the outer make.
+          sed -i 's/-j ${BUILD_NUM_JOBS} -t/-j 2 -t/' "$build_script"
+          grep -n "cmake --build" "$build_script"
+
       - name: Cross-compile CPython 3.10 ARMv7 wheel
         working-directory: tensorflow_src
         run: |
           set -euxo pipefail
           make -j1 -C tensorflow/lite/tools/pip_package docker-build \
+            BASE_IMAGE=ubuntu:22.04 \
             TENSORFLOW_TARGET=armhf \
-            PYTHON_VERSION=3.10
+            PYTHON_VERSION=3.10 \
+            NUMPY_VERSION=1.21.2
 
       - name: Collect and inspect wheel
         run: |
