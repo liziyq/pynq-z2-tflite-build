@@ -1,0 +1,84 @@
+name: Build PYNQ-Z2 TFLite Runtime
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-armv7-wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Show build-host information
+        run: |
+          set -euxo pipefail
+          uname -a
+          docker --version
+          df -h
+
+      - name: Free space on the temporary GitHub runner
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune --all --force
+          df -h
+
+      - name: Download TensorFlow 2.13.0 source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v2.13.0 \
+            https://github.com/tensorflow/tensorflow.git tensorflow_src
+
+      - name: Change ARM target from VFPv4 to Cortex-A9 VFPv3
+        run: |
+          set -euxo pipefail
+          script="tensorflow_src/tensorflow/lite/tools/cmake/download_toolchains.sh"
+          test -f "$script"
+          grep -n "neon-vfpv4" "$script"
+          sed -i 's/-mfpu=neon-vfpv4/-mfpu=neon-vfpv3 -mfloat-abi=hard/g' "$script"
+          grep -n "neon-vfpv3" "$script"
+          if grep -q "neon-vfpv4" "$script"; then
+            echo "ERROR: VFPv4 flag is still present"
+            exit 1
+          fi
+
+      - name: Cross-compile CPython 3.10 ARMv7 wheel
+        working-directory: tensorflow_src
+        run: |
+          set -euxo pipefail
+          make -j1 -C tensorflow/lite/tools/pip_package docker-build \
+            TENSORFLOW_TARGET=armhf \
+            PYTHON_VERSION=3.10
+
+      - name: Collect and inspect wheel
+        run: |
+          set -euxo pipefail
+          mkdir -p wheelhouse inspect
+          wheel="$(find tensorflow_src -type f -name 'tflite_runtime-*.whl' | head -n 1)"
+          test -n "$wheel"
+          cp "$wheel" wheelhouse/
+          unzip -q "$wheel" -d inspect
+          wrapper="$(find inspect -type f -name '_pywrap_tensorflow_interpreter_wrapper.so' | head -n 1)"
+          test -n "$wrapper"
+          file "$wrapper" | tee wheelhouse/binary_type.txt
+          readelf -A "$wrapper" | tee wheelhouse/arm_attributes.txt
+          grep -Eq "Tag_CPU_arch: v7|Tag_CPU_name:.*7-A" wheelhouse/arm_attributes.txt
+          grep -q "Tag_FP_arch: VFPv3" wheelhouse/arm_attributes.txt
+          if grep -q "Tag_FP_arch: VFPv4" wheelhouse/arm_attributes.txt; then
+            echo "ERROR: Generated wheel still targets VFPv4"
+            exit 1
+          fi
+          cd wheelhouse
+          sha256sum ./*.whl | tee SHA256SUMS.txt
+          ls -lh
+
+      - name: Upload PYNQ-Z2 installation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pynq-z2-tflite-runtime-v2.13.0-cp310-vfpv3
+          path: wheelhouse/
+          if-no-files-found: error
+          retention-days: 14
